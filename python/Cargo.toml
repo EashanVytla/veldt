@@ -1,0 +1,17 @@
+[package]
+name = "veldt-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_veldt"
+crate-type = ["cdylib"]
+
+[dependencies]
+veldt-core = { path = "../crates/veldt-core" }
+veldt-index = { path = "../crates/veldt-index" }
+veldt-decode = { path = "../crates/veldt-decode" }
+veldt-engine = { path = "../crates/veldt-engine" }
+veldt-reader-lerobot = { path = "../crates/veldt-reader-lerobot" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"

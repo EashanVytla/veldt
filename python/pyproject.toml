@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "veldt"
+version = "0.1.0"
+description = "Seek-optimized video data loader for ML training"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+
+[tool.maturin]
+python-source = "."
+module-name = "veldt._veldt"
+features = ["pyo3/extension-module"]
