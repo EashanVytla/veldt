@@ -1,0 +1,13 @@
+[package]
+name = "veldt-reader-lerobot"
+version = "0.1.0"
+edition = "2021"
+description = "LeRobot v3 dataset reader for veldt"
+
+[dependencies]
+veldt-core = { workspace = true }
+veldt-index = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+arrow = { version = "54", default-features = false, features = ["json"] }

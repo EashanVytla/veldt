@@ -1,0 +1,14 @@
+[package]
+name = "veldt-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for veldt: index, verify, bench"
+
+[[bin]]
+name = "veldt"
+path = "src/main.rs"
+
+[dependencies]
+veldt-core = { workspace = true }
+veldt-index = { workspace = true }
+veldt-reader-lerobot = { workspace = true }

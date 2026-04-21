@@ -1,0 +1,8 @@
+[package]
+name = "veldt-cache"
+version = "0.1.0"
+edition = "2021"
+description = "Belady-eviction decoded frame cache for veldt"
+
+[dependencies]
+veldt-core = { workspace = true }

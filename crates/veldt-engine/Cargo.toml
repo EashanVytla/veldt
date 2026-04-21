@@ -1,0 +1,13 @@
+[package]
+name = "veldt-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Pipeline orchestrator for veldt"
+
+[dependencies]
+veldt-core = { workspace = true }
+veldt-index = { workspace = true }
+veldt-scheduler = { workspace = true }
+veldt-decode = { workspace = true }
+veldt-cache = { workspace = true }
+tokio = { workspace = true }

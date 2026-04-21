@@ -1,0 +1,10 @@
+[package]
+name = "veldt-decode"
+version = "0.1.0"
+edition = "2021"
+description = "Rayon + ffmpeg decode pool for veldt"
+
+[dependencies]
+veldt-core = { workspace = true }
+rayon = { workspace = true }
+ffmpeg-next = "8"

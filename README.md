@@ -1,14 +1,14 @@
 # veldt
 
-### A seek-optimized data loader for robot learning, built in Rust.
+### A seek-optimized data loader for video-heavy ML training, built in Rust.
 
 ---
 
 ## Overview
 
-veldt reads existing robot learning datasets (starting with LeRobot v3) and serves training batches to PyTorch at GPU speed — no format conversion, no frame extraction, no data duplication. A Belady-optimal prefetch scheduler uses the known epoch shuffle order to eliminate the P99 tail-latency stalls that starve GPUs on video-heavy datasets.
+veldt reads existing datasets (starting with LeRobot v3) and serves training batches to PyTorch at GPU speed — no format conversion, no frame extraction, no data duplication. An epoch-aware, Belady-optimal scheduler uses the known shuffle order to eliminate the P99 tail-latency stalls that starve GPUs on video-heavy datasets.
 
-Drop-in Python API via PyO3. Tokio for async I/O, Rayon for parallel decode, DLPack for zero-copy tensor transfer.
+Drop-in Python API via PyO3. Tokio for async I/O through OpenDAL (local + S3 + GCS + HF Hub behind one interface), Rayon for parallel decode, ffmpeg filter graphs for fused decode-and-transform, DLPack for zero-copy tensor transfer.
 
 **Modes** (in implementation order):
 
@@ -16,15 +16,17 @@ Drop-in Python API via PyO3. Tokio for async I/O, Rayon for parallel decode, DLP
 2. **Streaming + cache** — Trains while streaming; subsequent epochs run at local speed.
 3. **Streaming only** — No local persistence, for storage-constrained environments.
 
+**Scope.** Built first for robot learning (LeRobot, PI0, ALOHA, DROID). The pipeline is format-agnostic; video generation training (Open-Sora, HunyuanVideo) has the same underlying access pattern — random clip sampling over compressed video — and is a first-class Phase 4 target.
+
 ---
 
 ## The Problem
 
-Robot learning datasets pair MP4 video with tabular control data (Parquet). Training requires shuffled random access across episodes. Both dominant loading approaches break down on this access pattern.
+Video-heavy training pairs MP4 video with tabular control or label data (Parquet). Training requires shuffled random access. Both dominant loading approaches break down on this access pattern.
 
 ### Local: PyTorch DataLoader + LeRobot
 
-N worker processes each seek into MP4 files, decode frames via PyAV/ffmpeg, pickle-serialize tensors, and pass them to the main process. MP4 inter-frame compression (I/P/B frames) means random seeks must decode from the nearest keyframe forward — potentially 30+ wasted frames. Cold seeks are catastrophic.
+N worker processes each seek into MP4 files, decode frames via torchcodec/PyAV/ffmpeg, pickle-serialize tensors, and pass them to the main process. MP4 inter-frame compression (I/P/B frames) means random seeks must decode from the nearest keyframe forward — potentially 30+ wasted frames. Cold seeks are catastrophic.
 
 Benchmarks on `lerobot/aloha_sim_insertion_human` (480×640, 50fps, 50 episodes, 4 workers):
 
@@ -32,11 +34,9 @@ Benchmarks on `lerobot/aloha_sim_insertion_human` (480×640, 50fps, 50 episodes,
 |---|---|
 | Throughput | 71.3 samples/sec |
 | P50 / P99 batch latency | 3.6 ms / 21,680 ms |
-| Mean CPU | 5.0% |
+| Mean CPU | 5.0% (workers idle, waiting on I/O — not CPU-bound) |
 
-The 6,000x P50→P99 spread confirms the bottleneck is I/O latency from cold keyframe seeks, not CPU decode. At batch level, 1% of batches already stall for 20+ seconds on this small dataset (~1.5 GB video) where much of the data fits in the OS page cache. On production datasets (DROID: 350 hours, OXE: 903M timesteps), the page cache covers a negligible fraction. The cold-seek rate per sample rises sharply, pushing both P50 and P99 batch latency upward.
-
-Additional overhead: per-worker CPython interpreters with high memory cost, and the GIL forcing process-level parallelism instead of lightweight threads.
+The 6,000× P50→P99 spread confirms the bottleneck is I/O latency from cold keyframe seeks. At batch level, 1% of batches already stall for 20+ seconds on this small dataset (~1.5 GB video) where much of the data fits in the OS page cache. On production datasets (DROID: 8.7 TB, OXE: 903M timesteps), the page cache covers a negligible fraction. The cold-seek rate per sample rises sharply, pushing both P50 and P99 upward.
 
 ### Streaming: HuggingFace IterableDataset
 
@@ -49,15 +49,42 @@ Same dataset, streaming mode:
 | Throughput | 4.7 samples/sec |
 | P50 / P99 batch latency | 13,195 ms / 19,845 ms |
 
-15x slower than local, no parallelism. Parallelism is structurally unavailable: PyTorch `IterableDataset` assigns one worker per shard, and LeRobot v3 consolidates episodes into a single data Parquet per chunk (`num_shards=1`). Attempting `num_workers > 1`:
+15× slower than local. The root cause is a chain of primitive-level decisions in the HF / LeRobot streaming path:
+
+| # | What it does | Why it's slow |
+|---|---|---|
+| 1 | `IterableDataset` with `num_shards=1` (v3 consolidates episodes per chunk) | PyTorch forces one worker per shard → single-threaded |
+| 2 | Buffer-shuffle draws from first N examples, replaces as consumed | **Shuffle order is not known at epoch start** — blocks any ahead-of-time planning |
+| 3 | Synchronous HTTP fetch per sample via HF Hub | Each sample blocks on network RTT; no prefetch |
+| 4 | Per-sample seek via torchcodec/PyAV | Each call re-validates decoder state; cold seeks hit the keyframe scan |
+| 5 | `set_format(type='torch')` path broken (LeRobot #1282, closed "not planned") | Python-object deepcopy per sample defeats the torch-tensor fast path |
+| 6 | Filename resolution + redirects through HF Hub | Per-sample DNS + redirect + TLS handshake unless connection is held |
+| 7 | No inter-sample seek grouping | Random 32 samples = 32 independent HTTP range requests |
+
+Attempting `num_workers > 1`:
 
 ```
 Too many dataloader workers: 3 (max is dataset.num_shards=1).
 ```
 
+Row 2 is the architectural lynchpin: buffer-shuffle silently prevents any epoch-level scheduling. Until the full shuffle order is knowable at epoch start, Belady-style planning is impossible.
+
 ### Root Cause
 
-MP4 has good random seek at the container level — the moov atom indexes exact byte offsets per keyframe. The problem is one layer below: H.264/AV1 keyframes (I-frames) occur every ~30 frames; all other frames (P/B) encode only diffs and can't be decoded independently. Seeking to an arbitrary frame means jumping to the nearest keyframe (fast), then decoding every frame forward to the target (wasteful). With keyframes every ~30 frames, ~97% of randomly sampled targets require decoding 10-25 throwaway frames first. Pre-extracting frames (WebDataset-style) eliminates this at the cost of 10-50x storage blowup.
+MP4 has good random seek at the container level — the moov atom indexes exact byte offsets per keyframe. The problem is one layer below: H.264/AV1 keyframes (I-frames) occur every ~30 frames; all other frames (P/B) encode only diffs and can't be decoded independently. Seeking to an arbitrary frame means jumping to the nearest keyframe (fast), then decoding every frame forward to the target (wasteful). With keyframes every ~30 frames, ~97% of randomly sampled targets require decoding 10-25 throwaway frames first. Pre-extracting frames (WebDataset-style) eliminates this at the cost of 10-50× storage blowup.
+
+---
+
+## Why Now
+
+This isn't a tuning problem reported in isolation — it's an ecosystem-wide signal that's being treated as codec or hardware limitation.
+
+- **huggingface/lerobot#1623** — SmolVLA training dataloader wait (~1s) exceeds backprop time (~0.7s) on a many-core server. AV1 decode measured 5× slower than H.264. Reporter abandoned video datasets for pre-extracted images despite the storage cost.
+- **huggingface/lerobot#2282** — 2× regression between 0.3.3 and 0.3.4 traced to the dataloading path. GPU utilization oscillates 0–100% — canonical data starvation.
+- **LeRobot v3 defaults to AV1** (better compression, much slower decode). The tax is paid by every new v3 dataset.
+- **torchcodec** (PyTorch's own decoder) lists "approximate seeking mode" as its top-priority fix because seek accuracy requires an initial linear scan. veldt's keyframe index *is* approximate seeking, available today. On CPU random access, torchcodec is 3.3× slower than decord (meta-pytorch/torchcodec#426).
+
+The common prescribed fixes are "use more cores" or "switch decoder." Neither addresses the structural issue: no existing loader plans across samples and across videos using known epoch-level ordering.
 
 ---
 
@@ -65,25 +92,37 @@ MP4 has good random seek at the container level — the moov atom indexes exact 
 
 ### Key Insight
 
-Training doesn't sample individual frames at random. Each sample needs a **temporal window** (~50 consecutive frames for action chunking). The true pattern is random-episode, sequential-window — and sequential reads are exactly what codecs optimize for. The expensive part is just the initial seek per window.
+Training doesn't sample individual frames at random. Each sample needs a **clip** — a range of consecutive frames (~50 for robot action chunking, 16–300 for video generation). Sequential reads within a clip are exactly what codecs optimize for. The expensive part is just the initial seek.
 
 ### Pipeline
 
 ```
-PLAN → PREFETCH → DECODE → SLICE + TRANSFORM → DLPACK → GPU
+PLAN → PREFETCH → DECODE (fused with filter graph) → DLPACK → GPU
 ```
 
-**Plan (Belady scheduler).** At epoch start, veldt receives the full shuffle order and maps each sample to its required keyframe group (~30 frames from one keyframe to the next). This produces `(keyframe_group, first_needed_batch, last_needed_batch)` triples for the entire epoch. Because shuffle order is known in advance, Belady's optimal eviction is implementable — items are evicted immediately after their last consumer and prefetched just before their first.
+**Plan (Belady scheduler).** At epoch start, veldt receives the full shuffle order and asks each reader to translate sample indices into a format-aware `FetchPlan` (for MP4: keyframe groups). The scheduler then produces `(fetch_unit, first_needed_batch, last_needed_batch)` triples for the entire epoch. Because the shuffle order is known in advance, Belady's optimal eviction is implementable — items are evicted immediately after their last consumer and prefetched just before their first.
 
-**Prefetch (Tokio).** Async tasks read MP4 byte ranges ahead of training per the Belady schedule. Multiple episodes fetched concurrently. I/O overlaps with GPU computation.
+**Prefetch (Tokio + OpenDAL).** Async tasks issue byte-range reads ahead of training per the Belady schedule. One code path handles local disk, S3, GCS, Azure, and HF Hub — OpenDAL is the backend. Multiple episodes fetch concurrently. I/O overlaps with GPU computation.
 
-**Decode (Rayon).** Compressed segments are decoded by a Rayon thread pool via `ffmpeg-next` (optional NVDEC). True thread-level parallelism — no GIL, no process forking. Decoded frames enter a bounded cache with Belady eviction.
+**Decode (Rayon + ffmpeg filter graph).** Compressed segments decode in a Rayon thread pool via `ffmpeg-next`, optionally through NVDEC. Resize, color conversion, and normalization fuse into the same ffmpeg filter graph — on the NVDEC path, output lands in CUDA memory directly with no host→device copy. Stochastic augmentation (random crop, color jitter) is deferred to user-side PyTorch on GPU, so the cache sits pre-augmentation.
 
-**Slice + Transform.** Frame windows are sliced from cached keyframe groups. Resize and normalize run in Rust. Stochastic augmentation (random crop, color jitter) is left to user-side PyTorch on GPU. Cache sits post-decode/pre-transform, so augmentation stays stochastic across epochs.
+**DLPack transfer.** Batched tensors go to PyTorch via `pyo3-dlpack` / `torch.from_dlpack()`. Single-process, zero-copy.
 
-**DLPack transfer.** Batched tensors go to PyTorch via `pyo3-dlpack` / `torch.from_dlpack()`. Zero-copy within a single process — no inter-process communication needed since Rust threads replace worker processes entirely. With NVDEC, frames decode directly to GPU memory.
+**Tabular path.** Actions/states read from Parquet via `arrow-rs`, packed into tensors, transferred through the same DLPack path.
 
-**Tabular path.** Actions/states read from Parquet via `arrow-rs`, packed into tensors, transferred through the same DLPack path. Arrow is an internal detail; users see only `torch.Tensor`.
+### Architecture: stateless server + stateful client
+
+"Server" in veldt means **precomputed sidecar index files** sitting alongside the source media — not a daemon. Indices record keyframe byte offsets, PTS→frame maps, codec metadata, and optional norm stats. `veldt index <path>` produces them once; every subsequent trainer reads them without coordination. S3/GCS/HF Hub are already the HTTP range-read server.
+
+The stateful layer lives on the client:
+
+| Layer | Where | Lifetime |
+|---|---|---|
+| Sidecar indices (`*.vkf`) | Alongside source media (local or remote bucket) | Regenerated on dataset version bump |
+| Compressed segment cache | Client disk (Mode 2) | LRU / TTL per trainer |
+| Decoded frame cache | Client RAM | Epoch-scoped, Belady-evicted |
+
+Missing sidecars trigger an inline build with a warning, so users never hit a hard error from a cold dataset.
 
 ### Batch-Aware Seek Grouping
 
@@ -97,7 +136,7 @@ Cache is bounded by concurrent working set, not dataset size. For 32 samples acr
 ~40 keyframe groups × 30 frames × 921,600 bytes ≈ 1.1 GB
 ```
 
-Belady eviction releases groups immediately after their last consumer. Zero additional storage beyond the original dataset.
+Belady eviction releases groups immediately after their last consumer. No additional on-disk storage in Mode 1. Mode 2 stores compressed byte ranges only, bounded by an explicit budget.
 
 ---
 
@@ -105,13 +144,13 @@ Belady eviction releases groups immediately after their last consumer. Zero addi
 
 ### Mode 1: Local (MVP)
 
-Dataset on local disk. Tokio handles async disk I/O, Rayon handles parallel decode, Belady drives eviction.
+Dataset on local disk. Tokio + OpenDAL handle async I/O; Rayon handles parallel decode; Belady drives eviction.
 
 **Target:** P99 from 21.8s → sub-100ms. Throughput from 71 → 500+ samples/sec. GPU utilization 85-95%. This mode alone justifies the project — the bottleneck is structural, not a tuning problem.
 
 ### Mode 2: Streaming + Local Cache
 
-First epoch streams compressed MP4 segments from HuggingFace Hub via async HTTP while training proceeds. Segments cached to disk as they arrive. Subsequent epochs run at local speed. Unlike a blocking download, training starts in seconds — critical for large datasets (DROID: 350 hours, OXE: 903M timesteps).
+First epoch streams compressed MP4 segments over HTTP range reads while training proceeds. Segments cache to disk as they arrive. Subsequent epochs run at local speed. Unlike a blocking download, training starts in seconds — critical for DROID (8.7 TB) and OXE-scale datasets.
 
 Cache stores original compressed byte ranges — no decompression, no inflation.
 
@@ -119,12 +158,41 @@ Cache stores original compressed byte ranges — no decompression, no inflation.
 
 Same as Mode 2 but segments are not persisted. Re-fetches each epoch. For shared clusters with limited SSD, quick experiments, or CI/CD pipelines.
 
-**Cache strategy configuration:**
+### Cache Strategy
+
+Three independent knobs — one per cache tier, not one aggregate budget:
+
+| Knob | Default | Controls |
+|---|---|---|
+| `compressed_cache_gb` | 0 (Mode 1) / 10 (Mode 2) | Disk-backed compressed segments |
+| `decoded_cache_gb` | 2 | RAM decoded-frame cache (Belady-evicted) |
+| `prefetch_depth` | 64 | Belady lookahead in samples |
+
+Caching mode selects the eviction policy:
 
 - `PostDecode` — Decoded frames in RAM. Stochastic augmentation each epoch. Default for training.
 - `PostTransform` — Final tensors. Fastest, but freezes augmentation. For evaluation.
 - `CompressedOnly` — Compressed segments on disk (Mode 2). Re-decode on access.
 - `None` — No caching. Re-fetch and re-decode (Mode 3).
+
+---
+
+## Format Tricks
+
+Each supported format exposes a native primitive; the reader's job is to exploit it. The `FetchPlan` the Belady scheduler operates on is format-aware at the reader level and opaque above it.
+
+| Format | Primitive | Cold-access cost | veldt's move |
+|---|---|---|---|
+| MP4 H.264/HEVC | moov atom → byte offset; decode from nearest I-frame | Decode 10-25 P/B frames before target | Sidecar keyframe index; batch seeks by GOP; precomputed PTS map |
+| MP4 AV1 | Same primitives, ~5× slower decode | Very expensive | Hardware decode mandatory; longer GOP tolerance; warn if no NVDEC/VideoToolbox |
+| WebM / VP9 | SeekHead + cluster index | One cluster read | Cluster-aligned batching |
+| Parquet | Row groups + column chunks + column statistics | Whole row group materialized | Column projection (drop unused cameras); row-group-aware prefetch |
+| Arrow IPC | Memory-mapped random access | None if resident | mmap directly; no intermediate cache |
+| HDF5 | Chunk index + per-chunk compression | Chunk decompress | Chunk-aligned access; parallel chunk fetch |
+| Zarr | One chunk per file + consolidated metadata | Per-chunk HTTP GET | Async chunk fetching; consolidated-metadata read at open |
+| RLDS / TFRecord | Sequential + sidecar index | Full record read | Build index at convert time; cache shard order |
+| MCAP (Foxglove) | Chunk Index + Message Index | One chunk read | Message-index sub-chunk precision; map topics → tensor columns |
+| WebDataset (tar) | Sequential within shard | Whole shard on random | Shuffle shards, not samples; prefetch 1-2 shards |
 
 ---
 
@@ -135,12 +203,27 @@ veldt defines a trait-based reader interface rather than hard-coding formats:
 ```rust
 pub trait DatasetReader: Send + Sync {
     fn len(&self) -> usize;
-    async fn get(&self, index: usize) -> Result<Sample>;
-    fn prefetch_hint(&self, indices: &[usize]) {}
+
+    // Return a specific clip range, not just a sample index.
+    async fn get(&self, index: usize, spec: ClipSpec) -> Result<Sample>;
+
+    // Epoch-start planning: reader decides how to group primitive fetches.
+    // FetchPlan is format-aware at the reader; opaque to the scheduler.
+    fn plan_fetch(&self, requests: &[(usize, ClipSpec)]) -> FetchPlan;
+
+    // Optional: open persistent connections, madvise mmaps, etc.
+    fn prefetch_hint(&self, plan: &FetchPlan) {}
+}
+
+pub struct ClipSpec {
+    pub start_frame: u64,
+    pub num_frames: u32,      // variable-length for video gen; fixed for robot learning
+    pub stride: u32,
+    pub resolution: (u32, u32),
 }
 ```
 
-Everything below the reader (scheduling, prefetch, decode, caching, batching, DLPack) is format-agnostic. The trait is also exposed as a Python protocol via PyO3 for users who don't write Rust.
+Everything above the reader — Belady scheduling, prefetch, decoding, caching, batching, DLPack — is format-agnostic. The trait is exposed as a Python protocol via PyO3 for users who don't write Rust.
 
 **Built-in reader priority:**
 
@@ -148,6 +231,8 @@ Everything below the reader (scheduling, prefetch, decode, caching, batching, DL
 2. RLDS/TFRecord (Open X-Embodiment)
 3. HDF5 (robomimic)
 4. Zarr (Diffusion Policy)
+5. MCAP (Foxglove) — robotics multimodal logs
+6. CSV + MP4 clips (Open-Sora, HunyuanVideo, video generation)
 
 ---
 
@@ -161,13 +246,15 @@ loader = veldt.Loader(
     batch_size=32,
     resize=(224, 224),
     normalize=True,
-    num_decode_threads=8,      # Rayon pool size
-    cache_budget_gb=2.0,       # Decoded frame cache bound
-    mode="local",              # "local", "stream_cached", "stream"
+    num_decode_threads=None,       # None → num_physical_cores
+    compressed_cache_gb=10,        # Mode 2 disk-backed segments
+    decoded_cache_gb=2,            # RAM decoded-frame cache
+    prefetch_depth=64,             # Belady lookahead in samples
+    mode="local",                  # "local", "stream_cached", "stream"
 )
 
 for epoch in range(num_epochs):
-    loader.set_epoch(epoch)    # Triggers Belady schedule rebuild
+    loader.set_epoch(epoch)        # Triggers Belady schedule rebuild
     for batch in loader:
         # batch.frames  → torch.Tensor [B, T, C, H, W] (via DLPack)
         # batch.actions → torch.Tensor [B, T, action_dim]
@@ -178,20 +265,40 @@ for epoch in range(num_epochs):
         loss.backward()
 ```
 
+### Ergonomics
+
+- **Format auto-detection.** `veldt.Loader(path=...)` inspects the path and picks the reader; no explicit `reader=` argument unless overriding.
+- **Dataset presets.** `veldt.Loader.from_preset("aloha" | "droid" | "pusht" | "libero")` sets codec, camera names, normalization stats, clip length.
+- **Observability.** `loader.stats()` returns cache hit rates, queue depths, decode fps, GPU-idle fraction.
+- **Calibration.** `loader.calibrate()` runs a short probe at init and tunes decode threads + prefetch depth.
+- **Explain mode.** `loader.explain(epoch=0)` prints the Belady schedule as human-readable pseudo-code.
+- **Graceful fallback.** Missing keyframe index, unsupported codec, or bad timestamps → slow-path (torchcodec) with a one-line warning. Never a hard error.
+- **Env overrides.** Every knob has a `VELDT_*` equivalent for script-based sweeps.
+- **Checkpoint/resume.** `loader.state_dict() / load_state_dict()` matching `IterableDataset` semantics.
+- **PyTorch `Dataset` conformance.** `veldt.Dataset` wraps the reader as a `torch.utils.data.Dataset` for training loops that can't swap the outer DataLoader.
+
+### CLI
+
+- `veldt index <path>` — precompute sidecar indices (keyframe offsets, PTS maps).
+- `veldt bench <path>` — probe a dataset and print a recommended config block.
+- `veldt verify <path>` — check sidecar validity, flag corrupt media.
+
 ---
 
 ## Technology Stack
 
 | Component | Crate / Tool | Role |
 |---|---|---|
-| Async I/O & prefetch | `tokio` | Disk reads, HTTP streaming, prefetch scheduling |
+| Unified I/O | `opendal` (+ `tokio` runtime) | Local disk, S3, GCS, Azure, HF Hub behind one interface |
 | Parallel decode | `rayon` | Multi-threaded keyframe group decoding |
-| Video decode | `ffmpeg-next` | MP4/H.264/H.265/AV1 frame decoding |
-| Hardware decode | NVDEC via `cudarc` | Optional GPU-accelerated video decode |
-| Parquet reading | `arrow-rs` | Read tabular data (actions, states) |
+| Video decode + transform | `ffmpeg-next` | MP4/H.264/H.265/AV1 decode fused with filter graph (scale, format, normalize) |
+| Hardware decode | NVDEC via `cudarc` | Optional GPU-accelerated decode; output in CUDA memory |
+| Parquet reading | `arrow-rs` | Tabular data (actions, states) |
 | Python bridge | `pyo3` | Expose Rust API to Python |
 | Tensor transfer | `pyo3-dlpack` | Zero-copy Rust → PyTorch via DLPack |
-| Keyframe index | Custom | MP4 moov atom parsing, sidecar index file |
+| Sidecar index | Custom (`*.vkf`) | Keyframe byte offsets, PTS map, codec metadata |
+
+**OpenDAL gotcha.** The default `RangeReader` discards its internal stream on every `seek`, triggering a fresh S3 GET. Wrap with a BufferReader (the pattern contributed back by Greptime) so consecutive reads within a keyframe group reuse one HTTP connection.
 
 ---
 
@@ -200,16 +307,23 @@ for epoch in range(num_epochs):
 ### Phase 1: Local Mode (MVP)
 
 - LeRobot v3 reader (Parquet + MP4)
-- Keyframe index builder (moov atom parser)
+- Keyframe index builder (moov atom parser) + `veldt index` CLI
 - Belady epoch scheduler
-- Rayon parallel decode pool
+- Rayon parallel decode pool with ffmpeg filter graph fusion
 - DLPack → PyTorch transfer
-- Basic Python API (`veldt.Loader`)
-- Benchmark suite vs PyTorch DataLoader
+- Python API with three-tier cache budgets
+- Benchmark suite vs PyTorch DataLoader + torchcodec (CPU and CUDA)
+
+### Phase 1.5: PI0 Validation
+
+- Integrate veldt into `openpi` / `openpi_pytorch` training loop
+- Run PI0 fine-tuning on LIBERO end-to-end
+- Report GPU utilization and wall-clock delta vs default LeRobot loader
+- Land as `examples/openpi_pi0_libero.py`
 
 ### Phase 2: Streaming + Cache
 
-- Tokio HTTP range-request fetcher
+- OpenDAL-backed HTTP range fetcher with BufferReader wrapper
 - Disk-backed compressed segment cache
 - Epoch-0 hybrid mode (stream while training)
 - Cache management (eviction, integrity)
@@ -222,7 +336,8 @@ for epoch in range(num_epochs):
 
 ### Phase 4: Ecosystem
 
-- RLDS/TFRecord, HDF5, Zarr readers
+- RLDS/TFRecord, HDF5, Zarr, MCAP readers
+- Open-Sora / HunyuanVideo reader (CSV + MP4 with bucket batching)
 - Python-defined reader protocol
 - NVDEC hardware decode integration
 - Multi-node distributed shard coordination
@@ -240,7 +355,7 @@ All data from `lerobot/aloha_sim_insertion_human` (50 episodes, 25K frames, 480�
 | Total time (6,400 samples) | 89.7 s |
 | Throughput | 71.3 samples/sec |
 | P50 / P95 / P99 batch latency | 3.6 / 163 / 21,680 ms |
-| Mean / Max CPU | 5.0% / 42.3% |
+| Mean / Max CPU | 5.0% / 42.3% (workers idle on I/O) |
 
 ### Streaming (0 workers, buffer 1000)
 
@@ -260,6 +375,33 @@ All data from `lerobot/aloha_sim_insertion_human` (50 episodes, 25K frames, 480�
 
 Streaming wins on small datasets that fit in buffer. The relationship inverts on real video data.
 
+### Precompute Once, Train Many
+
+All veldt numbers assume `veldt index` has been run once against the dataset. The index is a few hundred KB per episode, lives alongside the source media, and is shared across every trainer hitting that bucket. Cold indexing takes seconds for a typical LeRobot dataset — and it's the only piece of work that has to happen before training can start.
+
+### Stress-Test Matrix
+
+Integration with external repos is an exit criterion for Phase 4:
+
+| Repo | Format | Purpose |
+|---|---|---|
+| `Physical-Intelligence/openpi` | LeRobot v3 | PI0 flagship (Phase 1.5) |
+| `huggingface/lerobot` SmolVLA | LeRobot v3 | Reproduce and fix the #1623 bottleneck |
+| `NVlabs/diffusion_policy` | Zarr | Non-video; tests reader abstraction |
+| `hpcaitech/Open-Sora` | CSV + MP4 clips | Video generation, variable-length clips |
+| `Tencent/HunyuanVideo` | CSV + MP4 clips | Video generation at scale |
+| `ARISE-Initiative/robomimic` | HDF5 | Non-MP4; tests format breadth |
+
+---
+
+## Related Work
+
+- **torchcodec** (Meta PyTorch) — the current default video decoder inside LeRobot. Releases the GIL, supports CUDA decode. Operates per-`VideoDecoder`; no cross-video or epoch-level coordination. veldt's edge is the scheduler, not the decoder.
+- **Vidformer** (Dominik Winecki, OSU) — Rust + ffmpeg + OpenDAL stack for interactive annotation and Video-on-Demand rendering. Solves the "instant first-frame of an edit script" problem. Adjacent stack, different goal (rendering vs training). veldt may reuse Vidformer's SIR / filter-graph engine in Phase 4 rather than reinventing.
+- **NVIDIA DALI** — GPU-accelerated preprocessing for deep learning. Broad support, but no epoch-aware planning and no Belady-style eviction.
+- **WebDataset** — tar-based sequential access. Sidesteps the seek problem by forcing sequential reads, at the cost of shuffle quality and 10-50× storage inflation.
+- **MCAP / Foxglove** — indexed container format for robotics logs, with native chunk and message indices. Complementary format; veldt treats it as a first-class reader target.
+
 ---
 
 ## Design Decisions
@@ -272,13 +414,20 @@ Streaming wins on small datasets that fit in buffer. The relationship inverts on
 
 **Why DLPack over Arrow?** Arrow is for columnar data. DLPack is for dense N-d tensors, natively supported by PyTorch, and works on GPU memory. Arrow is used internally for Parquet; the Python API returns only `torch.Tensor` via DLPack.
 
-**Why Tokio + Rayon?** Different bottlenecks. Tokio: async I/O and prefetch scheduling (latency hiding). Rayon: parallel CPU decode (throughput). Together they keep the GPU fed continuously.
+**Why Tokio + Rayon + OpenDAL?** Tokio: async I/O and prefetch scheduling (latency hiding). Rayon: parallel CPU decode (throughput). OpenDAL: one code path for local disk and object storage. Together they keep the GPU fed continuously.
+
+**Why fuse resize/normalize into the ffmpeg filter graph?** Avoids one CPU→GPU copy per sample on NVDEC paths; avoids extra memcpy on CPU paths. The transform spec compiles to the same filter graph regardless of backend.
+
+**Why stateless server?** S3/GCS already do the server job. Running a daemon in front adds ops burden without improving range-read performance. Sidecar files in the bucket give every trainer the shared work without coordination.
+
+**Why not lead with "no GIL, no process forking"?** torchcodec also releases the GIL. The real edge is cross-video, cross-batch, epoch-aware coordination — the scheduler, not the decoder.
 
 ---
 
 ## Target Audience
 
 - Robot learning researchers training VLA models (PI0, Octo, OpenVLA, Diffusion Policy) on video datasets
+- Video generation teams (Open-Sora, HunyuanVideo-class) hitting CPU decode bottlenecks on petabyte-scale data
 - Teams scaling from sim (pusht) to real-world data (ALOHA, DROID, Bridge) and hitting data loading walls
 - LeRobot users with low GPU utilization during training
-- Rust developers looking to contribute to robotics ML# veldt
+- Rust developers looking to contribute to ML systems

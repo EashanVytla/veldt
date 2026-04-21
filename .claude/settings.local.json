@@ -14,7 +14,18 @@
       "Bash(python3 -c \"import ast; ast.parse\\(open\\(''benchmarks/bench_local.py''\\).read\\(\\)\\); print\\(''bench_local.py: OK''\\)\")",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\(''benchmarks/bench_streaming.py''\\).read\\(\\)\\); print\\(''bench_streaming.py: OK''\\)\")",
       "Bash(python3 -c \"import torch; import psutil; import numpy; print\\(''torch:'', torch.__version__\\); print\\(''psutil:'', psutil.__version__\\); print\\(''numpy:'', numpy.__version__\\)\")",
-      "Bash(python3 -c \"import lerobot; print\\(''lerobot:'', lerobot.__version__\\)\")"
+      "Bash(python3 -c \"import lerobot; print\\(''lerobot:'', lerobot.__version__\\)\")",
+      "Bash(cargo check:*)",
+      "Bash(command -v rustup)",
+      "Bash(command -v rustc)",
+      "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs)",
+      "Bash(sh -s -- -y)",
+      "Bash(ffmpeg -version)",
+      "Bash(pkg-config:*)",
+      "Bash(ffmpeg -y -f lavfi -i \"testsrc=duration=3:size=96x96:rate=30\" -c:v libx264 -g 30 -pix_fmt yuv420p /Users/eashanvytla/workspace/veldt/tests/fixtures/mini_lerobot/test_video.mp4)",
+      "Bash(ffprobe -v quiet -show_entries frame=pict_type,pts_time -select_streams v /Users/eashanvytla/workspace/veldt/tests/fixtures/mini_lerobot/test_video.mp4)",
+      "Bash(/Users/eashanvytla/workspace/veldt/.venv/bin/python:*)",
+      "Bash(.venv/bin/python:*)"
     ]
   }
 }
