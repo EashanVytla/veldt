@@ -10,4 +10,9 @@ veldt-index = { workspace = true }
 veldt-scheduler = { workspace = true }
 veldt-decode = { workspace = true }
 veldt-cache = { workspace = true }
+veldt-reader-lerobot = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
 tokio = { workspace = true }

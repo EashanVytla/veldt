@@ -8,6 +8,7 @@ members = [
     "crates/veldt-cache",
     "crates/veldt-engine",
     "crates/veldt-cli",
+    "python",
 ]
 resolver = "2"
 

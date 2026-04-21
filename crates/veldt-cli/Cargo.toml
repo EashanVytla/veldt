@@ -12,3 +12,4 @@ path = "src/main.rs"
 veldt-core = { workspace = true }
 veldt-index = { workspace = true }
 veldt-reader-lerobot = { workspace = true }
+clap = { version = "4", features = ["derive"] }

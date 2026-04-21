@@ -1,1 +1,3 @@
-// Pipeline orchestrator — Step 7
+mod engine;
+
+pub use engine::{Engine, EngineConfig};
